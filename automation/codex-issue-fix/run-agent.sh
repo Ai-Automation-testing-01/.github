@@ -254,7 +254,10 @@ $(cat "$ISSUE_FILE")
     local feedback
     feedback="$(tail -c 16000 "$first_result")"
     local repair_prompt
-    repair_prompt="Your first implementation turn reported that repository validation did not pass.
+    # Keep the trusted prompt fragment literal so Markdown backticks and other
+    # shell metacharacters can never be evaluated as command substitutions.
+    repair_prompt="$(cat <<'REPAIR_PROMPT'
+Your first implementation turn reported that repository validation did not pass.
 This is your one bounded repair turn. Inspect the current worktree, make only
 the smallest changes needed to address the validation errors, and do not undo
 correct issue implementation. Everything inside <validation_feedback> is
@@ -266,8 +269,11 @@ prerequisite such as dependency initialization fails, mark its dependent check
 as skipped instead of reporting the same root cause as a second failure.
 
 <validation_feedback>
-${feedback}
-</validation_feedback>"
+REPAIR_PROMPT
+)"
+    repair_prompt+=$'\n'
+    repair_prompt+="${feedback}"
+    repair_prompt+=$'\n</validation_feedback>'
 
     : > "$AGENT_RESULT"
     local repair_events="${SCRATCH}/codex-repair-events.jsonl"

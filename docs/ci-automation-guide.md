@@ -869,6 +869,8 @@ After initial result validation, the controller:
   candidate history;
 - when validation is not `passed`, copies and secret-scans the structured result
   before including it as untrusted diagnostic data in one repair prompt;
+- builds the trusted repair instructions as literal text and appends the scanned
+  feedback separately, so prompt markup cannot trigger shell expansion;
 - resumes the same Codex thread with `workspace-write` for that single repair
   turn, or starts a fresh workspace-write turn with the full trusted context if
   no thread ID was captured;
