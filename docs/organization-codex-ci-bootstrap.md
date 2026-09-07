@@ -123,33 +123,18 @@ NEW_ORG/.github/
 └── AGENTS.md
 ```
 
-### Step 1.2: Customize Organization Names & References
+### Step 1.2: Customize Organization Names & Documentation
 
-In the newly copied files, replace upstream organization strings with your destination organization:
+The reusable workflows are now generic by default:
+- They dynamically check out the current organization's central repository using `repository: ${{ github.repository_owner }}/.github`.
+- Git fix commits use the neutral author `codex-automation-bot[bot]`.
 
-```bash
-# Check where upstream references exist
-grep -RInE 'IndiaCommunityAnimals|animal-automation' --exclude-dir=.git .
-```
-
-Replace the following:
-1. In `.github/workflows/reusable-codex-issue-fix.yml` (around line 113):
-   ```yaml
-   - name: Check out trusted organization automation
-     uses: actions/checkout@v6 # or pinned SHA
-     with:
-       repository: NEW_ORG/.github # <--- Update here
-       ref: ${{ inputs.automation_ref }}
+You only need to review and update organization names in policy and documentation files:
+1. In `AGENTS.md` and `README.md`: Update organization names and links to match `NEW_ORG`.
+2. (Optional) Run a search to verify any custom branding or policy references:
+   ```bash
+   grep -RInE 'IndiaCommunityAnimals|animal-automation' --exclude-dir=.git .
    ```
-2. In `.github/workflows/reusable-codex-review-fix.yml` (around line 103):
-   ```yaml
-   - name: Check out trusted organization automation
-     uses: actions/checkout@v6
-     with:
-       repository: NEW_ORG/.github # <--- Update here
-       ref: ${{ inputs.automation_ref }}
-   ```
-3. In `AGENTS.md` and `README.md`: Update organization names and documentation links.
 
 ### Step 1.3: Configure Central Workflow Access
 
@@ -436,6 +421,13 @@ jobs:
       PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
 ```
 
+> [!IMPORTANT]
+> **Why `NEW_ORG` must be static in `jobs.<job_id>.uses` (GitHub Actions Limitation):**
+> You **cannot** use dynamic expressions like `${{ github.repository_owner }}` in the `uses:` line of caller workflows.
+> - GitHub Actions parses `uses:` during workflow graph compilation before runtime contexts exist. Trying to use an expression in `uses:` will cause GitHub to error: `The workflow is not valid. The uses attribute cannot contain expressions.`
+> - Therefore, `jobs.issue-fix.uses` must always specify your organization name as an exact static string (e.g. `NEW_ORG/.github/...` or `Ai-Automation-testing-01/.github/...`).
+> - Inside the central workflow steps, expressions *are* supported, which is why the central reusable workflow dynamically checks out `${{ github.repository_owner }}/.github` without hardcoding.
+
 ### Step 4.5: Add the Review-Fix Caller Workflow
 
 Create `.github/workflows/codex-review-fix.yml`:
@@ -464,16 +456,43 @@ jobs:
       PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
 ```
 
-### Step 4.6: Verify Issue Templates
+### Step 4.6: Verify Issue Templates & Understand Approval Gates
 
 In `TARGET_REPO` on GitHub, click **Issues** → **New Issue**. You should see the inherited forms:
 - 🐛 **Bug report**
 - 🚀 **Feature request**
 - 🛠️ **Technical task**
 - 💬 **General issue or discussion**
+- 📝 **Blank issue** (if enabled in repo)
+
+#### Which forms trigger Codex Auto-Fix?
+
+The workflow checks for the required markdown heading `### Target branch` before triggering:
+
+| Issue Template | Triggers Codex Auto-Fix? | Why? |
+|---|:---:|---|
+| 🐛 **Bug report** | **YES** | Contains mandatory `Target branch` field. Generates a branch and PR with bugfix. |
+| 🚀 **Feature request** | **YES** | Contains mandatory `Target branch` field. Generates a branch and PR with new feature. |
+| 🛠️ **Technical task** | **YES** | Contains mandatory `Target branch` field. Generates a branch and PR with refactoring/task work. |
+| 💬 **General issue or discussion** | ❌ **NO** | Deliberately has **no `Target branch`**. Used for questions/planning; ignored by automation. |
+| 📝 **Blank issue** | ❌ **NO** | Has no pre-set headings or `Target branch`. Ignored by automation. |
+
+#### Issue Approval & Execution Rules
+
+For the 3 implementation forms (Bug, Feature, Task), execution depends on author permissions:
+
+1. **Maintainer / Admin Authors:**
+   - If an issue is opened by a user with `admin` or `maintain` repository permissions, it is **automatically approved**.
+   - The workflow adds the `codex-run-approved` label and starts the coding sandbox immediately.
+2. **External Contributor Authors:**
+   - If opened by an external contributor or non-maintainer, the workflow tags the issue with **`codex-run-requested`**.
+   - **Codex does NOT run yet.** The workflow halts safely without touching code.
+   - A maintainer must review the issue and manually apply the **`codex-run-approved`** label to authorize Codex execution.
+3. **Safety on Edit (Invalidation):**
+   - If an external contributor edits an approved issue, the workflow automatically revokes approval by removing `codex-run-approved` and re-applying `codex-run-requested`, preventing unauthorized prompt injection.
 
 > [!NOTE]
-> If these templates do not appear, check whether `TARGET_REPO` contains a local `.github/ISSUE_TEMPLATE` directory. If any local issue template exists, GitHub suppresses all inherited templates. Either remove the local templates or copy the central ones locally.
+> If inherited templates do not appear under **New Issue**, check whether `TARGET_REPO` contains a local `.github/ISSUE_TEMPLATE` directory. If any local issue template exists, GitHub suppresses all inherited templates. Either remove the local templates or copy the central ones locally.
 
 ### Step 4.7: Configure Branch Protection & Repository Rulesets
 
@@ -587,6 +606,7 @@ If Codex sessions expire or return `401 Unauthorized`:
 | **Setup failed: `setup.sh: Permission denied`** | `setup.sh` missing executable bit in Git | Run `chmod +x path/to/setup.sh` and `git add --chmod=+x path/to/setup.sh` then commit. |
 | **Codex completed but no PR was created** | Local validation commands in `SKILL.md` failed, or protected path was touched | Check Actions run log. If validation failed, fix the code/skill. Codex is strictly forbidden from modifying `.github/workflows/*`, `.agents/*`, or `.env*`. |
 | **Review-fix runs in an infinite loop** | Commit message guard bypassed or modified | Ensure commit message contains `[codex-autofix]`, which the caller step checks to prevent re-triggering. |
+| **`The uses attribute cannot contain expressions`** | Attempted to use dynamic `${{ github.repository_owner }}` in caller `jobs.<id>.uses` | GitHub Actions strictly requires `jobs.<id>.uses` to be a literal static string. Replace with actual organization name (e.g. `NEW_ORG/.github/...`). |
 
 ---
 

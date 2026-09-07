@@ -8,7 +8,7 @@ on:
     inputs:
       # Keep script checkout aligned with the reusable workflow reference.
       automation_ref:
-        description: Branch, tag, or SHA in IndiaCommunityAnimals/.github
+        description: Branch, tag, or SHA in the organization .github repository
         required: false
         default: main
         type: string
@@ -61,7 +61,9 @@ jobs:
   verify-and-fix:
     # Pin the runner image; repository skills own any stack-specific tooling.
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Leave room for one bounded validation-repair turn after the initial
+    # implementation without allowing an unbounded agent loop.
+    timeout-minutes: 75
     env:
       APPROVAL_LABEL: ${{ inputs.approval_label }}
       REQUEST_LABEL: ${{ inputs.request_label }}
@@ -110,7 +112,7 @@ jobs:
       - name: Check out trusted organization automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          repository: IndiaCommunityAnimals/.github
+          repository: ${{ github.repository_owner }}/.github
           ref: ${{ inputs.automation_ref }}
           path: organization-automation
           fetch-depth: 1
@@ -565,10 +567,11 @@ jobs:
           TARGET_BRANCH: ${{ steps.verify.outputs.target_branch }}
           REPOSITORY_ROOT: ${{ github.workspace }}/target-repository
           PATCH_FILE: ${{ runner.temp }}/codex-issue-fix/agent.patch
+          BOT_NAME: ${{ github.repository_owner }}-automation[bot]
+          BOT_EMAIL: ${{ github.repository_owner }}-automation[bot]@users.noreply.github.com
         run: |
-          git -C "$REPOSITORY_ROOT" config user.name "animal-automation-bot[bot]"
-          git -C "$REPOSITORY_ROOT" config user.email \
-            "animal-automation-bot[bot]@users.noreply.github.com"
+          git -C "$REPOSITORY_ROOT" config user.name "$BOT_NAME"
+          git -C "$REPOSITORY_ROOT" config user.email "$BOT_EMAIL"
           (
             cd "$REPOSITORY_ROOT"
             gh auth setup-git
@@ -635,7 +638,9 @@ jobs:
               repo: context.repo.repo,
               head: process.env.FIX_BRANCH,
               base: process.env.TARGET_BRANCH,
-              draft: false,
+              // Keep validation evidence advisory for PR creation: unresolved
+              // checks produce a draft instead of discarding reviewable work.
+              draft: result.validation.status !== 'passed',
               title: `fix: ${cleanTitle}`,
               body: `## Problem
 
@@ -723,6 +728,20 @@ jobs:
                   const validation = result?.validation;
                   if (validation && ['passed', 'failed', 'blocked'].includes(validation.status)) {
                     details = `\n\nValidation status: **${validation.status}**`;
+                    if (Array.isArray(validation.commands) && validation.commands.length > 0) {
+                      const commandLines = validation.commands.map((entry) => {
+                        const command = String(entry.command || 'unknown command')
+                          .replace(/`/g, '\\`');
+                        const result = String(entry.result || 'unknown');
+                        const commandDetails = String(entry.details || '')
+                          .replace(/\s+/g, ' ')
+                          .trim()
+                          .slice(0, 500);
+                        return `- \`${command}\` — **${result}**` +
+                          (commandDetails ? `: ${commandDetails}` : '');
+                      }).join('\n');
+                      details += `\n\nValidation checks:\n${commandLines}`;
+                    }
                     if (validation.status !== 'passed') {
                       details += `\n\nReason: ${validation.failure_reason ||
                         'The repository validation did not pass.'}`;
