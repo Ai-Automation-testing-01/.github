@@ -1,0 +1,817 @@
+# Reusable organization workflow. Repository-local callers own the issue event
+# and token permissions; this file owns verification, implementation, and PR
+# logic.
+name: Reusable Codex Issue Fix
+
+on:
+  workflow_call:
+    inputs:
+      # Keep script checkout aligned with the reusable workflow reference.
+      automation_ref:
+        description: Branch, tag, or SHA in IndiaCommunityAnimals/.github
+        required: false
+        default: main
+        type: string
+      approval_label:
+        description: Label that a maintainer adds to authorize the coding agent
+        required: false
+        default: codex-run-approved
+        type: string
+      request_label:
+        description: Label automatically added to an unapproved issue
+        required: false
+        default: codex-run-requested
+        type: string
+      # ADDED: per-caller opt-in switches for the optional MCP servers.
+      # MCP servers run outside the Codex sandbox and hold network access, so
+      # each repository's caller explicitly enables only what it needs.
+      enable_aws_mcp:
+        description: Enable the AWS Knowledge MCP server for this run
+        required: false
+        default: false
+        type: boolean
+      enable_terraform_mcp:
+        description: Enable the Terraform MCP server for this run
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      # Pass only Codex authentication; do not inherit unrelated organization
+      # secrets.
+      CODEX_AUTH_JSON:
+        required: true
+      # GitHub App credentials used to publish branches and create PRs.
+      CLIENT_ID:
+        required: true
+      PRIVATE_KEY:
+        required: true
+
+# A caller must grant the same permissions; reusable workflows cannot elevate them.
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  # Include the repository because issue numbers repeat across repositories.
+  group: codex-issue-fix-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-fix:
+    # Pin the runner image; repository skills own any stack-specific tooling.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      APPROVAL_LABEL: ${{ inputs.approval_label }}
+      REQUEST_LABEL: ${{ inputs.request_label }}
+      # ADDED: result labels so maintainers can filter automated issues.
+      COMPLETED_LABEL: codex-run-completed
+      FAILED_LABEL: codex-run-failed
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      FIX_BRANCH: codex/issue-${{ github.event.issue.number }}
+      # ADDED: optional agent switches. MCP servers are disabled by default and
+      # only turn on when a caller opts in via the inputs above.
+      ENABLE_AWS_MCP: ${{ inputs.enable_aws_mcp }}
+      ENABLE_TERRAFORM_MCP: ${{ inputs.enable_terraform_mcp }}
+      # Pin the official Terraform MCP image by both version and immutable
+      # manifest digest. The container receives no host mounts or credentials.
+      TERRAFORM_MCP_IMAGE: hashicorp/terraform-mcp-server:1.2.0@sha256:bd095e2b442a2cb61255fe4db52f9e824f35d307a2044784c95d37a93f18d324
+
+    steps:
+      # ADDED: fail fast with a clear message instead of a cryptic agent or
+      # token error several minutes into the run.
+      - name: Validate required secrets
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+        run: |
+          status=0
+          if [ -z "$CODEX_AUTH_JSON" ]; then
+            echo "::error::CODEX_AUTH_JSON is empty or not configured"
+            status=1
+          elif ! printf '%s' "$CODEX_AUTH_JSON" | jq -e . >/dev/null 2>&1; then
+            echo "::error::CODEX_AUTH_JSON is not valid JSON"
+            status=1
+          fi
+          if [ -z "$CLIENT_ID" ]; then
+            echo "::error::CLIENT_ID is empty or not configured"
+            status=1
+          fi
+          if [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::PRIVATE_KEY is empty or not configured"
+            status=1
+          fi
+          exit "$status"
+
+      # Central control files are loaded from the requested reviewed automation ref,
+      # never from the issue-selected target branch.
+      - name: Check out trusted organization automation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: IndiaCommunityAnimals/.github
+          ref: ${{ inputs.automation_ref }}
+          path: organization-automation
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Keep label provisioning and application in the workflow so inherited
+      # issue forms do not depend on pre-existing repository labels.
+      - name: Ensure automation labels
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          VERIFIER_PATH: ${{ github.workspace }}/organization-automation/automation/codex-issue-fix/verify-issue.js
+        with:
+          script: |
+            const {
+              automationLabelsForIssue
+            } = require(process.env.VERIFIER_PATH);
+
+            // FIX: the previous version referenced an undefined `labels` variable
+            // here, which crashed whenever a contributor edited an approved issue.
+            const currentLabels = (context.payload.issue.labels || []).map((label) =>
+              typeof label === 'string' ? label : label.name
+            );
+
+            const definitions = {
+              [process.env.APPROVAL_LABEL]: {
+                color: '1d76db',
+                description: 'Maintainer approval to run Codex issue automation'
+              },
+              [process.env.REQUEST_LABEL]: {
+                color: 'fbca04',
+                description: 'Issue requested Codex automation and awaits maintainer approval'
+              },
+              // ADDED: result labels provisioned alongside the workflow labels.
+              [process.env.COMPLETED_LABEL]: {
+                color: '0e8a16',
+                description: 'Codex automation produced a pull request for this issue'
+              },
+              [process.env.FAILED_LABEL]: {
+                color: 'd93f0f',
+                description: 'Codex automation ran but did not produce a pull request'
+              }
+            };
+
+            for (const [name, definition] of Object.entries(definitions)) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+                try {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name,
+                    ...definition
+                  });
+                } catch (createError) {
+                  // Another issue run may have created the same label concurrently.
+                  if (createError.status !== 422) {
+                    throw createError;
+                  }
+                }
+              }
+            }
+
+            let maintainer = false;
+            try {
+              const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: context.payload.issue.user.login
+              });
+              maintainer = ['admin', 'maintain'].includes(permission.data.permission);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            // Editing a contributor issue invalidates its previous approval.
+            // The maintainer must review the changed request again.
+            // FIX: use currentLabels instead of the previously undefined `labels`.
+            if (context.payload.action === 'edited' && !maintainer &&
+                currentLabels.includes(process.env.APPROVAL_LABEL)) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: process.env.APPROVAL_LABEL
+              });
+            }
+
+            const automationLabels = automationLabelsForIssue(context.payload.issue, maintainer)
+              .map((label) => label === 'codex-run-approved'
+                ? process.env.APPROVAL_LABEL
+                : process.env.REQUEST_LABEL);
+            if (automationLabels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: automationLabels
+              });
+            }
+
+      - name: Verify issue and target branch
+        id: verify
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          VERIFIER_PATH: ${{ github.workspace }}/organization-automation/automation/codex-issue-fix/verify-issue.js
+        with:
+          script: |
+            // The helper is trusted central code; issue title and body remain data.
+            const fs = require('fs');
+            const path = require('path');
+            const {
+              extractTargetBranch,
+              validateIssue
+            } = require(process.env.VERIFIER_PATH);
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const labels = issue.labels.map((label) =>
+              typeof label === 'string' ? label : label.name
+            );
+            const validation = validateIssue(issue);
+            const targetBranch = extractTargetBranch(issue.body || '');
+            const approved = labels.includes(process.env.APPROVAL_LABEL);
+            const problems = [...validation.problems];
+            let approvalActor = '';
+
+            // ADDED: defense in depth on top of the caller-side guard. Issues
+            // events also fire for pull requests, and closed issues must not be
+            // processed even if something labels them.
+            if (issue.pull_request) {
+              problems.push('This automation only runs on issues, not pull requests.');
+            }
+            if (issue.state !== 'open') {
+              problems.push(`Issue is ${issue.state}; only open issues can be processed.`);
+            }
+
+            const hasMaintainerPermission = async (login) => {
+              try {
+                const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: login
+                });
+                return ['admin', 'maintain'].includes(permission.data.permission);
+              } catch (error) {
+                if (error.status === 404) return false;
+                throw error;
+              }
+            };
+
+            // A maintainer-authored issue is auto-approved by the label step.
+            // For everyone else, verify that the approval label was actually
+            // added by a current repository maintainer. Checking only the
+            // current label would let a user with label permissions self-approve.
+            if (approved && !(await hasMaintainerPermission(issue.user.login))) {
+              const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100
+              });
+              const approvalEvent = events
+                .filter((event) => event.event === 'labeled' &&
+                  event.label?.name === process.env.APPROVAL_LABEL)
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+              if (!approvalEvent || !(await hasMaintainerPermission(approvalEvent.actor?.login))) {
+                problems.push(`Only a repository maintainer may add the \`${process.env.APPROVAL_LABEL}\` label.`);
+              } else {
+                approvalActor = approvalEvent.actor.login;
+              }
+            } else if (approved) {
+              approvalActor = issue.user.login;
+            }
+
+            // FIX: this block was duplicated further down and pushed the same
+            // problem twice; it now appears only once.
+            if (!approved) {
+              problems.push(
+                `A maintainer must add the \`${process.env.APPROVAL_LABEL}\` label ` +
+                'before the coding agent can run.'
+              );
+            }
+
+            // ADDED: once approval is verified, drop the pending-request label.
+            // This does not retrigger the caller because the caller only reruns
+            // on the approval label.
+            if (approved &&
+                !problems.some((problem) => problem.includes('Only a repository maintainer')) &&
+                labels.includes(process.env.REQUEST_LABEL)) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: process.env.REQUEST_LABEL
+              });
+            }
+
+            if (!targetBranch) {
+              problems.push('Add a `### Target branch` section containing one branch name.');
+            } else {
+              try {
+                await github.rest.repos.getBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  branch: targetBranch
+                });
+              } catch (error) {
+                if (error.status === 404) {
+                  problems.push(`Target branch \`${targetBranch}\` does not exist.`);
+                } else {
+                  throw error;
+                }
+              }
+            }
+
+            const existing = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              head: `${context.repo.owner}:${process.env.FIX_BRANCH}`,
+              per_page: 1
+            });
+            if (existing.data.length > 0) {
+              problems.push(`An automation PR already exists: ${existing.data[0].html_url}`);
+            }
+
+            // The issue snapshot is owner-readable and lives outside both checkouts.
+            const scratch = path.join(process.env.RUNNER_TEMP, 'codex-issue-fix');
+            fs.mkdirSync(scratch, { recursive: true });
+            fs.writeFileSync(
+              path.join(scratch, 'issue.md'),
+              `# ${issue.title}\n\n${issue.body || ''}\n`,
+              { mode: 0o600 }
+            );
+
+            core.setOutput('eligible', problems.length === 0 ? 'true' : 'false');
+            core.setOutput('target_branch', targetBranch || '');
+            core.setOutput('approval_actor', approvalActor);
+            core.setOutput('problems_json', JSON.stringify(problems));
+
+      # Reuse one marked bot comment so edits do not create notification spam.
+      - name: Report verification result
+        if: steps.verify.outputs.eligible != 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PROBLEMS_JSON: ${{ steps.verify.outputs.problems_json }}
+        with:
+          script: |
+            const marker = '<!-- codex-issue-verification -->';
+            const problems = JSON.parse(process.env.PROBLEMS_JSON);
+            const body = `${marker}
+            ### 🤖 Codex issue verification
+
+            This issue is not ready for automated implementation:
+
+            ${problems.map((problem) => `- ${problem}`).join('\n')}
+
+            Edit the issue to correct the details. The workflow will verify it again.`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+            const previous = comments.find((comment) =>
+              comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      # Assemble only organization policy and common rules before issue-selected
+      # repository content is checked out.
+      - name: Stage trusted common prompt and controller
+        if: steps.verify.outputs.eligible == 'true'
+        run: |
+          scratch="${RUNNER_TEMP}/codex-issue-fix"
+          automation="organization-automation/automation/codex-issue-fix"
+          cat \
+            organization-automation/AGENTS.md \
+            "${automation}/prompts/base.md" \
+            > "${scratch}/trusted-prompt.md"
+          cp "${automation}/run-agent.sh" "${scratch}/run-agent.sh"
+          cp "${automation}/agent-output.schema.json" \
+            "${scratch}/agent-output.schema.json"
+          chmod 700 "${scratch}/run-agent.sh"
+
+      # Checkout only the verified branch of the repository where the issue exists.
+      - name: Check out target repository branch
+        if: steps.verify.outputs.eligible == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.verify.outputs.target_branch }}
+          path: target-repository
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Pin both executable versions and verify the downloaded scanner archive.
+      - name: Install common automation tools
+        if: steps.verify.outputs.eligible == 'true'
+        id: tools
+        run: |
+          npm install --global @openai/codex@0.150.0
+          archive="${RUNNER_TEMP}/gitleaks.tar.gz"
+          bin_dir="${RUNNER_TEMP}/codex-common-bin"
+          mkdir -p "$bin_dir"
+          if [ "$ENABLE_TERRAFORM_MCP" = "true" ]; then
+            docker pull "$TERRAFORM_MCP_IMAGE"
+            docker image inspect "$TERRAFORM_MCP_IMAGE" >/dev/null
+          fi
+          curl --fail --silent --show-error --location \
+            --output "$archive" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  ${archive}" |
+            sha256sum --check --status
+          tar -xzf "$archive" -C "$bin_dir" gitleaks
+          chmod 700 "${bin_dir}/gitleaks"
+          echo "secret_scanner=${bin_dir}/gitleaks" >> "$GITHUB_OUTPUT"
+
+      # Repository-owned setup prepares dependencies before either Codex or
+      # GitHub credentials exist. It must not modify tracked/non-ignored files.
+      - name: Prepare repository validation environment
+        if: steps.verify.outputs.eligible == 'true'
+        id: prepare
+        env:
+          REPOSITORY_ROOT: ${{ github.workspace }}/target-repository
+        run: "${RUNNER_TEMP}/codex-issue-fix/run-agent.sh prepare"
+
+      # GitHub-hosted Ubuntu can restrict the user namespaces Bubblewrap needs.
+      # Record and restore both values so the privilege change is narrowly scoped.
+      - name: Prepare Codex Linux sandbox
+        if: steps.prepare.outputs.prepared == 'true'
+        id: sandbox-host
+        run: |
+          if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            echo "original_userns_clone=$(sysctl -n kernel.unprivileged_userns_clone)" \
+              >> "$GITHUB_OUTPUT"
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            echo "original_apparmor_userns=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" \
+              >> "$GITHUB_OUTPUT"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # Restore only the Codex token; GitHub credentials stay in the controller checkout.
+      - name: Restore Codex agent authentication
+        if: steps.prepare.outputs.prepared == 'true'
+        id: codex-auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          mkdir -p ~/.codex
+          printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json
+          chmod 600 ~/.codex/auth.json
+          echo "auth_file=${HOME}/.codex/auth.json" >> "$GITHUB_OUTPUT"
+
+      - name: Implement and validate issue
+        if: steps.prepare.outputs.prepared == 'true'
+        id: fix
+        env:
+          REPOSITORY_ROOT: ${{ github.workspace }}/target-repository
+          CODEX_AUTH_FILE: ${{ steps.codex-auth.outputs.auth_file }}
+          SECRET_SCANNER: ${{ steps.tools.outputs.secret_scanner }}
+        run: "${RUNNER_TEMP}/codex-issue-fix/run-agent.sh implement"
+
+      # Remove the credential file after the agent run, even if it exited unexpectedly.
+      - name: Remove Codex authentication file
+        if: always() && steps.codex-auth.outcome == 'success'
+        env:
+          CODEX_AUTH_FILE: ${{ steps.codex-auth.outputs.auth_file }}
+        run: |
+          if [ -n "$CODEX_AUTH_FILE" ] && [ -f "$CODEX_AUTH_FILE" ]; then
+            : > "$CODEX_AUTH_FILE"
+            rm --force -- "$CODEX_AUTH_FILE"
+          fi
+
+      # Repository cleanup is allowed to remove only the isolated validation
+      # environment and runs even when Codex or validation failed.
+      - name: Clean up repository validation environment
+        if: always() && steps.prepare.outcome != 'skipped'
+        run: |
+          agent_work="${RUNNER_TEMP}/codex-issue-fix/agent-work"
+          cleanup="${agent_work}/.agents/skills/repository-validation/scripts/cleanup.sh"
+          if [ -e "$cleanup" ]; then
+            if [ ! -x "$cleanup" ]; then
+              echo "::warning::Repository validation cleanup.sh is not executable"
+            else
+              "$cleanup" "$agent_work" ||
+                echo "::warning::Repository validation cleanup failed"
+            fi
+          fi
+
+      - name: Restore Linux sandbox host settings
+        if: always() && steps.sandbox-host.outcome != 'skipped'
+        env:
+          ORIGINAL_USERNS_CLONE: ${{ steps.sandbox-host.outputs.original_userns_clone }}
+          ORIGINAL_APPARMOR_USERNS: ${{ steps.sandbox-host.outputs.original_apparmor_userns }}
+        run: |
+          if [ -n "$ORIGINAL_USERNS_CLONE" ]; then
+            sudo sysctl -w "kernel.unprivileged_userns_clone=${ORIGINAL_USERNS_CLONE}" ||
+              echo "::warning::Could not restore kernel.unprivileged_userns_clone"
+          fi
+          if [ -n "$ORIGINAL_APPARMOR_USERNS" ]; then
+            sudo sysctl -w \
+              "kernel.apparmor_restrict_unprivileged_userns=${ORIGINAL_APPARMOR_USERNS}" ||
+              echo "::warning::Could not restore AppArmor user-namespace restriction"
+          fi
+
+      # Generate a GitHub App token so the PR triggers downstream workflows.
+      - name: Generate GitHub App token
+        if: steps.fix.outputs.patch_ready == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      # Use the GitHub App token for the push so the PR is attributed to the
+      # App rather than github-actions[bot].
+      - name: Publish candidate branch
+        if: steps.fix.outputs.patch_ready == 'true'
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_BRANCH: ${{ steps.verify.outputs.target_branch }}
+          REPOSITORY_ROOT: ${{ github.workspace }}/target-repository
+          PATCH_FILE: ${{ runner.temp }}/codex-issue-fix/agent.patch
+        run: |
+          git -C "$REPOSITORY_ROOT" config user.name "animal-automation-bot[bot]"
+          git -C "$REPOSITORY_ROOT" config user.email \
+            "animal-automation-bot[bot]@users.noreply.github.com"
+          (
+            cd "$REPOSITORY_ROOT"
+            gh auth setup-git
+            git checkout -B "$FIX_BRANCH" "origin/$TARGET_BRANCH"
+            git apply --index "$PATCH_FILE"
+            git commit -m "fix: address issue #${ISSUE_NUMBER}"
+
+            remote_ref="refs/heads/${FIX_BRANCH}"
+            remote_exit=0
+            remote_line="$(git ls-remote --exit-code --heads origin "$remote_ref")" ||
+              remote_exit=$?
+            if [ "$remote_exit" -eq 0 ]; then
+              remote_sha="${remote_line%%[[:space:]]*}"
+              git fetch origin \
+                "+${FIX_BRANCH}:refs/remotes/origin/${FIX_BRANCH}"
+              lease="${remote_ref}:${remote_sha}"
+            elif [ "$remote_exit" -eq 2 ]; then
+              lease="${remote_ref}:"
+            else
+              echo "::error::Could not inspect the existing automation branch"
+              exit "$remote_exit"
+            fi
+            git push --force-with-lease="$lease" origin \
+              "HEAD:${remote_ref}"
+          )
+          echo "did_fix=true" >> "$GITHUB_OUTPUT"
+
+      # Use the GitHub App token for PR creation so downstream workflows run.
+      - name: Open pull request
+        if: steps.publish.outputs.did_fix == 'true'
+        id: pull-request
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          TARGET_BRANCH: ${{ steps.verify.outputs.target_branch }}
+          RESULT_PATH: ${{ runner.temp }}/codex-issue-fix/agent-result.json
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          APPROVAL_ACTOR: ${{ steps.verify.outputs.approval_actor }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          TRIGGER_ACTOR: ${{ github.actor }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const issue = context.payload.issue;
+            const result = JSON.parse(fs.readFileSync(process.env.RESULT_PATH, 'utf8'));
+            const cleanTitle = issue.title
+              .replace(/^\[(Bug|Task|Feature)\]:\s*/i, '')
+              .slice(0, 180);
+
+            const commandLines = result.validation.commands.map((entry) =>
+              `- \`${entry.command}\` — **${entry.result}**` +
+              (entry.details ? `: ${entry.details}` : '')
+            ).join('\n');
+            const failure = result.validation.status === 'passed'
+              ? ''
+              : `\n\n**Failure reason:** ${result.validation.failure_reason ||
+                  'The repository validation did not pass.'}`;
+            const risks = result.risks.length > 0
+              ? result.risks.map((risk) => `- ${risk}`).join('\n')
+              : '- No additional risks reported by Codex.';
+
+            const pull = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: process.env.FIX_BRANCH,
+              base: process.env.TARGET_BRANCH,
+              draft: false,
+              title: `fix: ${cleanTitle}`,
+              body: `## Problem
+
+            Addresses #${issue.number}.
+
+            ## Root cause and approach
+
+            ${result.approach}
+
+            ## Validation
+
+            Overall status: **${result.validation.status}**
+
+            ${commandLines}${failure}
+
+            ## Risks and limitations
+
+            ${risks}
+
+            - Generated by automation and requires human review.
+            - No deployment, merge, Terraform apply, or remote database migration was run.
+
+            ## Documentation
+
+            ${result.documentation || 'No documentation update was required.'}
+
+            ## Automation audit
+
+            - Issue author: @${process.env.ISSUE_AUTHOR}
+            - Approval maintainer: @${process.env.APPROVAL_ACTOR}
+            - Triggered by: @${process.env.TRIGGER_ACTOR}
+            - Workflow run: ${process.env.WORKFLOW_RUN_ID}`
+            });
+            core.setOutput('url', pull.data.html_url);
+
+      # ADDED: if the branch was pushed but PR creation failed, remove the
+      # orphaned branch so reruns and repository hygiene are not affected.
+      - name: Delete orphaned branch if PR creation failed
+        if: always() && steps.publish.outputs.did_fix == 'true' && !steps.pull-request.outputs.url
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY_ROOT: ${{ github.workspace }}/target-repository
+        run: |
+          git -C "$REPOSITORY_ROOT" push origin --delete "$FIX_BRANCH" ||
+            echo "::warning::Could not delete orphaned branch ${FIX_BRANCH}"
+
+      # Report all eligible outcomes, including safe no-change outcomes.
+      - name: Report automation result
+        if: always() && steps.verify.outputs.eligible == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          DID_FIX: ${{ steps.publish.outputs.did_fix }}
+          PREPARE_REASON: ${{ steps.prepare.outputs.stop_reason }}
+          FIX_REASON: ${{ steps.fix.outputs.stop_reason }}
+          PR_URL: ${{ steps.pull-request.outputs.url }}
+          TARGET_BRANCH: ${{ steps.verify.outputs.target_branch }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          APPROVAL_ACTOR: ${{ steps.verify.outputs.approval_actor }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          TRIGGER_ACTOR: ${{ github.actor }}
+          RESULT_PATH: ${{ runner.temp }}/codex-issue-fix/agent-result.json
+          RESULT_SAFE_PATH: ${{ runner.temp }}/codex-issue-fix/agent-result.safe
+          COMPLETED_LABEL: ${{ env.COMPLETED_LABEL }}
+          FAILED_LABEL: ${{ env.FAILED_LABEL }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- codex-issue-fix-result -->';
+            const verificationMarker = '<!-- codex-issue-verification -->';
+            const prCreated = Boolean(process.env.PR_URL);
+            const prLine = process.env.DID_FIX === 'true' && prCreated
+              ? `PR: ${process.env.PR_URL}`
+              : 'No pull request was created.';
+            const stopReason = process.env.DID_FIX === 'true' && !prCreated
+              ? 'Branch was pushed, but pull request creation failed.'
+              : process.env.FIX_REASON || process.env.PREPARE_REASON ||
+                'The workflow failed before it could produce a change.';
+            let details = '';
+            if (fs.existsSync(process.env.RESULT_SAFE_PATH) &&
+                fs.existsSync(process.env.RESULT_PATH)) {
+              try {
+                const rawResult = fs.readFileSync(process.env.RESULT_PATH, 'utf8').trim();
+                if (rawResult) {
+                  const result = JSON.parse(rawResult);
+                  const validation = result?.validation;
+                  if (validation && ['passed', 'failed', 'blocked'].includes(validation.status)) {
+                    details = `\n\nValidation status: **${validation.status}**`;
+                    if (validation.status !== 'passed') {
+                      details += `\n\nReason: ${validation.failure_reason ||
+                        'The repository validation did not pass.'}`;
+                    }
+                  } else {
+                    core.warning('Codex result did not contain a usable validation status.');
+                  }
+                }
+              } catch {
+                core.warning('Could not parse the secret-scanned Codex result.');
+              }
+            }
+
+            // Keep result labels mutually exclusive across retries.
+            const succeeded = process.env.DID_FIX === 'true' && prCreated;
+            const resultLabel = succeeded
+              ? process.env.COMPLETED_LABEL
+              : process.env.FAILED_LABEL;
+            const staleResultLabel = succeeded
+              ? process.env.FAILED_LABEL
+              : process.env.COMPLETED_LABEL;
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: staleResultLabel
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                core.warning(`Could not remove stale result label: ${error.message}`);
+              }
+            }
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: [resultLabel]
+              });
+            } catch (error) {
+              core.warning(`Could not add result label: ${error.message}`);
+            }
+
+            const body = `${marker}
+            ### 🤖 Codex issue automation
+
+            - Target branch: \`${process.env.TARGET_BRANCH}\`
+            - Issue author: @${process.env.ISSUE_AUTHOR}
+            - Approval maintainer: @${process.env.APPROVAL_ACTOR || 'not approved'}
+            - Triggered by: @${process.env.TRIGGER_ACTOR}
+            - Workflow run: [${process.env.WORKFLOW_RUN_ID}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.WORKFLOW_RUN_ID})
+            - Result: ${stopReason}
+            - ${prLine}${details}`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+            const previousResult = comments.find((comment) =>
+              comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+            const previousVerification = comments.find((comment) =>
+              comment.user.type === 'Bot' && comment.body.includes(verificationMarker)
+            );
+
+            if (previousResult) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previousResult.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+            if (previousVerification) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previousVerification.id,
+                body: `${verificationMarker}\n### 🤖 Codex issue verification\n\nVerification passed.`
+              });
+            }
