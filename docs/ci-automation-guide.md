@@ -379,9 +379,11 @@ interactive approval, ignored user configuration, and the trusted output
 schema. The issue title and body are enclosed in `<github_issue>` and are data,
 not instructions.
 
-The structured result must contain an approach string, a validation status of
-`passed`, `failed`, or `blocked`, at least one validation command, a failure
-reason string, a risks array, and a documentation string.
+The structured result must contain a diff-wide summary, a non-empty change
+list, an implementation approach, a validation status of `passed`, `failed`, or
+`blocked`, at least one validation command, a failure reason string, a risks
+array, and a documentation string. Command results may also use `skipped` when
+a prerequisite did not complete.
 
 ### 5.12 Protect paths
 
@@ -404,10 +406,12 @@ branch that changed concurrently.
 
 ### 5.15 Create the PR
 
-The App token creates a normal, non-draft PR. Its base is the verified target
-branch. Its title is derived from the issue title. Its body contains the issue
-number, approach, commands and results, risks, limitations, and a human-review
-notice.
+The App token creates a PR whose base is the verified target branch. A fully
+validated candidate is opened ready for review; a candidate with failed or
+blocked validation is opened as a draft. Its title is derived from the issue
+title. Its body contains a diff-wide summary and change list, the objective file
+list from Git, implementation approach, commands and results, risks,
+limitations, and a human-review notice.
 
 ### 5.16 Report the result
 
@@ -427,7 +431,8 @@ deleted or merged.
 | No Codex change | No safe implementation was produced | None |
 | Protected path changed | Candidate rejected | None |
 | Secret scan failed | Sensitive value or scanner error | None |
-| Accepted patch | All gates passed | One branch and one PR |
+| Accepted validated patch | Safety gates and validation passed | One branch and one review-ready PR |
+| Accepted patch with incomplete validation | Safety gates passed; validation failed or was blocked | One branch and one draft PR |
 
 ## 7. Review-fix caller flow
 
@@ -846,10 +851,11 @@ codex exec
 error is written to `codex.log`, while JSON events are captured separately so
 the controller can retain the thread ID. A nonzero Codex exit emits
 `Codex agent execution failed`. The controller rejects a result unless it has
-string `approach`, `validation.status` equal to `passed`, `failed`, or
-`blocked`, a non-empty validation command array, a string failure reason, an
-array of risks, and string documentation. A non-passed result must have a
-non-empty failure reason.
+non-empty string `summary`, non-empty `changes` array, string `approach`,
+`validation.status` equal to `passed`, `failed`, or `blocked`, a non-empty
+validation command array, a string failure reason, an array of risks, and string
+documentation. A command whose prerequisite did not complete may be `skipped`.
+A non-passed overall result must have a non-empty failure reason.
 
 After initial result validation, the controller:
 
@@ -863,12 +869,17 @@ After initial result validation, the controller:
   candidate history;
 - when validation is not `passed`, copies and secret-scans the structured result
   before including it as untrusted diagnostic data in one repair prompt;
-- resumes the same Codex thread for that single repair turn, or starts a fresh
-  sandboxed turn with the full trusted context if no thread ID was captured;
+- resumes the same Codex thread with `workspace-write` for that single repair
+  turn, or starts a fresh workspace-write turn with the full trusted context if
+  no thread ID was captured;
 - reapplies the protected-path and baseline-to-candidate secret scans after the
   repair and accepts the repair turn's validation result as final;
-- copies the final structured result into a separate result-scan directory and
-  runs Gitleaks `dir --redact --no-banner --no-color` over it;
+- preserves the initial implementation summary when the repair turn only reruns
+  checks; if the repair changes code, it appends those implementation details;
+- derives an objective changed-file list from the final Git diff;
+- copies the final structured result and changed-file list into a separate
+  result-scan directory and runs Gitleaks `dir --redact --no-banner --no-color`
+  over it;
 - distinguishes a secret finding (scanner exit 1) from a scanner failure;
 - marks the result safe only after both scans pass;
 - opens a draft PR with the unresolved evidence when validation remains
@@ -917,16 +928,20 @@ fix: address issue #N
 ```
 
 If the branch already exists, it is fetched and pushed with a matching
-`--force-with-lease`; a new branch uses an empty lease. The PR is non-draft,
-uses the verified target branch as base, removes the `[Bug]`, `[Task]`, or
-`[Feature]` prefix from the issue title, truncates the remainder to 180
-characters, and creates the title `fix: <clean title>`.
+`--force-with-lease`; a new branch uses an empty lease. The PR uses the verified
+target branch as base, removes the `[Bug]`, `[Task]`, or `[Feature]` prefix from
+the issue title, truncates the remainder to 180 characters, and creates the
+title `fix: <clean title>`. Passed validation creates a review-ready PR; failed
+or blocked validation creates a draft.
 
-The generated PR body includes the issue number, approach, overall validation
-status, every command/result/details entry, a failure reason when status is not
-`passed`, risks, documentation status, and these fixed notices: automation
-generated it and requires human review; no deployment, merge, Terraform apply,
-or remote database migration was run.
+The generated PR body includes the issue number, diff-wide summary, semantic
+change list, Git-derived changed-file list, implementation approach, automated
+validation status, every command/result/details entry, a failure or blocking
+reason when status is not `passed`, risks, documentation status, and these fixed
+notices: automation generated it and requires human review; no deployment,
+merge, Terraform apply, or remote database migration was run. The text
+`Overall status: blocked` is intentionally not used: environment limitations
+are displayed as `incomplete — environment or tooling limitation`.
 
 The final issue result comment is marked
 `<!-- codex-issue-fix-result -->`. It reports the target branch, stop reason,
@@ -1050,37 +1065,34 @@ the negotiation transcript and cleanup candidates when those files exist.
 The comment explicitly tells a human to re-review new commits if the PR was
 already approved and states that fixes were committed directly to the branch.
 
-### 15.9 Why an issue PR can say `Overall status: blocked`
+### 15.9 Incomplete validation and prerequisite reporting
 
-The issue implementation schema deliberately permits validation statuses
-`passed`, `failed`, and `blocked`. The trusted issue prompt tells Codex to make
-one repair attempt when a check fails because of the implementation, but to
-retain the implementation and report the exact command and reason when an
-environment limitation or pre-existing problem prevents validation.
+The issue implementation schema permits overall validation statuses `passed`,
+`failed`, and `blocked`. `failed` means a check found an implementation or
+repository defect. `blocked` means the environment or toolchain prevented a
+check from completing. Individual commands may be `skipped` when a prerequisite
+failed; for example, `terraform validate` is skipped when `terraform init` did
+not complete instead of repeating a missing-provider error as a second failure.
 
-The issue controller does not reject a `blocked` status. It requires the
-structured result, protects the changed paths, secret-scans both the candidate
-history and the report, and then emits `patch_ready=true`. The workflow creates
-a draft PR when `patch_ready=true` but validation is not `passed`, so the PR
-body can contain a blocked validation status rather than losing the candidate.
-The PR body renders every reported command/result, the status, and the failure
-reason.
+The issue controller does not discard an otherwise safe candidate solely because
+validation is incomplete. It protects changed paths, secret-scans the candidate
+history and report, and emits `patch_ready=true`. The workflow creates a draft
+PR and labels the issue `codex-run-validation-blocked`; only a PR with passed
+validation receives `codex-run-completed`.
 
-For Terraform, `terraform init -backend=false` disables backend/state access;
-it does not eliminate provider installation. If the required provider is not
-cached and the validation environment cannot resolve or reach the provider
-registry, `init` is blocked and `validate` cannot load that provider. A TFLint
-plugin initialization or go-plugin handshake failure is a separate validation
-environment/tooling failure. The current output therefore shows one formatting
-success followed by dependent/provider and plugin initialization failures; it
-does not show that the Terraform change itself caused a syntax failure.
+A repair turn resumes with the same `workspace-write` sandbox as the initial
+turn. Its validation evidence becomes final, but a validation-only repair cannot
+overwrite the original implementation summary with a no-change message. The PR
+renders a semantic change list plus an objective list of files from the final
+Git diff.
 
-The repository validation skill makes this distinction explicit and requires
-Codex to report environment-blocked checks honestly. Terraform repositories
-also provide a `$terraform` implementation skill, which Codex uses to generate,
-run, and repair the appropriate commands itself. A blocked result remains
-visible evidence in a draft PR; it is not treated as permission to merge or
-deploy.
+Terraform repository setup should prepare providers before the network-restricted
+agent turn, store the Terraform data directory and plugin cache in writable,
+ignored workspace paths, and use a local provider mirror. TFLint should likewise
+run from the writable workspace with a writable temporary directory so its
+bundled go-plugin worker can complete the protocol handshake. A remaining
+blocked result is evidence that human follow-up is required; it is not permission
+to merge or deploy.
 
 ## 16. Definition of done
 

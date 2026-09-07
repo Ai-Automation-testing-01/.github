@@ -50,9 +50,10 @@ The automation divides responsibilities into a **Central Control Plane** (reusab
                  └─► Disposable Linux Sandbox exports codebase
                        └─► Runs optional setup.sh (installs CLI tools)
                              └─► Codex implements solution & validates locally via SKILL.md
-                                   └─► Gates: Validation passes + Protected path check + Gitleaks scan
+                                   └─► Gates: Protected path check + Gitleaks scan
                                          └─► GitHub App commits to `codex/issue-<ID>` branch
-                                               └─► Opens PR & tags issue `codex-run-completed`
+                                               ├─► Validation passed: review-ready PR + `codex-run-completed`
+                                               └─► Validation incomplete: draft PR + `codex-run-validation-blocked`
    ```
 
 2. **PR Review-Fix Loop Flow:**
@@ -533,7 +534,9 @@ Validate the entire pipeline using this sequential testing procedure.
    - The issue automatically receives the `codex-run-approved` label.
    - The runner executes `setup.sh`, runs Codex, executes validation from `SKILL.md`.
    - The GitHub App creates branch `codex/issue-<ID>` and opens a pull request.
-   - The issue is updated with a summary comment and labeled `codex-run-completed`.
+   - When validation passes, the issue is updated with a summary comment and
+     labeled `codex-run-completed`; incomplete validation instead creates a draft
+     PR and applies `codex-run-validation-blocked`.
 
 ### Test 2: Contributor Approval Gate
 1. Have a non-collaborator or test account open an implementation issue.
@@ -604,7 +607,9 @@ If Codex sessions expire or return `401 Unauthorized`:
 | **`actions/create-github-app-token` failed: App not found** | Using numeric `App ID` instead of `Client ID` in secret | Check `CLIENT_ID` secret. It must be the alphanumeric Client ID (e.g. `Iv23...`), not the numeric App ID. |
 | **Codex output empty or 401 Unauthorized** | Expired or invalid `CODEX_AUTH_JSON` | Re-authenticate via `codex login` on workstation and update the secret. |
 | **Setup failed: `setup.sh: Permission denied`** | `setup.sh` missing executable bit in Git | Run `chmod +x path/to/setup.sh` and `git add --chmod=+x path/to/setup.sh` then commit. |
-| **Codex completed but no PR was created** | Local validation commands in `SKILL.md` failed, or protected path was touched | Check Actions run log. If validation failed, fix the code/skill. Codex is strictly forbidden from modifying `.github/workflows/*`, `.agents/*`, or `.env*`. |
+| **Codex completed but no PR was created** | Protected path, secret scan, no-change, or publishing gate rejected the candidate | Check the Actions result comment. Failed or blocked validation alone should now create a draft PR. Codex remains forbidden from modifying `.github/workflows/*`, `.agents/*`, or `.env*`. |
+| **Terraform init/validate is blocked in Codex** | Providers were not prepared before the network sandbox, or Terraform runtime paths are outside the writable workspace | Prepare a lockfile-backed provider mirror during `setup.sh`; place `TF_DATA_DIR`, `TF_PLUGIN_CACHE_DIR`, and `TF_CLI_CONFIG_FILE` under an ignored workspace directory. |
+| **TFLint go-plugin handshake fails** | The binary or temporary socket directory is outside a writable/executable sandbox path | Install the pinned TFLint binary inside the isolated workspace, set workspace-local `TMPDIR`, and use `--no-parallel-runners` for recursive validation. |
 | **Review-fix runs in an infinite loop** | Commit message guard bypassed or modified | Ensure commit message contains `[codex-autofix]`, which the caller step checks to prevent re-triggering. |
 | **`The uses attribute cannot contain expressions`** | Attempted to use dynamic `${{ github.repository_owner }}` in caller `jobs.<id>.uses` | GitHub Actions strictly requires `jobs.<id>.uses` to be a literal static string. Replace with actual organization name (e.g. `NEW_ORG/.github/...`). |
 
@@ -617,7 +622,7 @@ Before approving the setup for production use, verify all 10 security invariants
 - [ ] **Supply-Chain Pinning:** Reusable workflow and `automation_ref` use a reviewed immutable commit SHA or controlled branch.
 - [ ] **Explicit Secrets:** Callers pass only `CLIENT_ID`, `PRIVATE_KEY`, and `CODEX_AUTH_JSON`; `secrets: inherit` is never used.
 - [ ] **Isolated Worktree:** Issue implementation runs in a disposable directory; GitHub tokens are not exposed to Codex.
-- [ ] **Validation Gate:** A PR is published only when `validation.status === 'passed'` from repository-owned `SKILL.md`.
+- [ ] **Validation Gate:** Only `validation.status === 'passed'` creates a review-ready PR; failed or blocked validation can create only a clearly labelled draft PR. Shipped changes still require normal required checks and human review.
 - [ ] **Protected Paths:** Codex cannot modify `.github/workflows/`, `.agents/`, `.codex/`, or `.env` files.
 - [ ] **Secret Scanning:** All diffs pass Gitleaks scanning before the GitHub App publishes any branch or PR.
 - [ ] **Fork Boundary:** Fork PRs are strictly excluded from receiving App tokens or Codex credentials.

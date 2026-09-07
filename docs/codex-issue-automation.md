@@ -94,10 +94,11 @@ Every caller repository owns its exact implementation-time checks in:
 ```
 
 The optional executable setup script may install locked dependencies, download
-pinned tooling, or start an isolated supporting service. It runs in the
-disposable export before Codex or GitHub credentials are restored. It must not
-perform validation or modify tracked/non-ignored files. Cleanup runs after the
-agent attempt even when validation fails.
+pinned tooling, prepare offline dependency mirrors, pre-initialize dependency
+data, or start an isolated supporting service. It runs in the disposable export
+before Codex or GitHub credentials are restored. It must not run the validation
+gates or modify tracked/non-ignored files. Cleanup runs after the agent attempt
+even when validation fails.
 
 Codex discovers this tracked repository skill from the isolated worktree. The
 trusted base prompt explicitly invokes `$repository-validation`, so Codex runs
@@ -172,9 +173,10 @@ cannot self-approve by adding the label or editing an old issue.
 
 Generated PRs and issue result comments include the issue author, approving
 maintainer, triggering actor, and GitHub Actions run ID for auditability.
-Completed runs receive `codex-run-completed`; eligible runs that do not publish
-a PR receive `codex-run-failed`. The workflow removes the opposite result label
-so retries cannot leave both states on one issue.
+Validated PRs receive `codex-run-completed`; draft PRs with failed or blocked
+validation receive `codex-run-validation-blocked`; eligible runs that do not
+publish a PR receive `codex-run-failed`. The workflow removes stale result labels
+so retries cannot leave conflicting states on one issue.
 
 ## Required settings
 
@@ -226,13 +228,16 @@ Callers should not use a mutable central branch for long-term operation.
 - Validation skill missing: no Codex run, branch, or PR.
 - Skill validation fails because of the implementation: Codex fixes the change
   and reruns the skill checks within its turn.
-- Validation cannot pass because of an implementation, environment, or
-  pre-existing problem: Codex reports the exact command and reason, but the
-  controller blocks branch and PR publication.
+- Validation still fails or is blocked after the bounded repair: Codex reports
+  the exact command and reason; the controller publishes a draft PR and labels
+  the issue `codex-run-validation-blocked`.
+- A prerequisite does not complete: dependent checks are reported as skipped,
+  not as duplicate failures.
 - Secret scan finding in candidate code or the agent report: no branch or PR.
 - PR creation forbidden by settings: branch may exist, job reports the GitHub API failure.
-- Agent produces an accepted patch: one commit on `codex/issue-N`, one normal
-  PR containing the agent's validation report, and one result comment.
+- Agent produces an accepted, validated patch: one commit on `codex/issue-N`,
+  one review-ready PR with a diff-wide change summary and validation report, and
+  one result comment.
 
 ## Local checks
 

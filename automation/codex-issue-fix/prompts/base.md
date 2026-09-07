@@ -28,18 +28,24 @@ Shared rules:
   setup script is provided, the trusted controller has already run it before
   this turn; do not run it again inside the network-restricted sandbox. Use the
   prepared tools and the repository's documented lockfiles, caches, or mirrors.
-  Never claim validation passed when dependency initialization failed. If a
-  check fails because of the implementation, make one repair attempt and rerun
-  the required checks exactly once. Do not begin a second repair cycle. If the
-  rerun still fails, or an environment limitation or pre-existing problem
-  prevents a pass, keep the implementation changes and report the exact failing
-  command, error, and reason instead of claiming success. Always report the
-  commands and actual results.
+  Never claim validation passed when dependency initialization failed. Run a
+  dependent check only when its prerequisite succeeds; otherwise report the
+  dependent check as `skipped` and name the failed prerequisite. Use `failed`
+  only for an implementation or repository defect and `blocked` only for an
+  environment or tooling limitation. If a check fails because of the
+  implementation, make one repair attempt and rerun the required checks exactly
+  once. Do not begin a second repair cycle. If the rerun still fails, or an
+  environment limitation or pre-existing problem prevents a pass, keep the
+  implementation changes and report the exact failing command, error, and
+  reason instead of claiming success. Always report the commands and actual
+  results.
 - Update documentation only when the implementation changes documented behavior.
 - If the issue cannot be implemented safely, make no changes and explain what
   information is missing.
 
-Return the final response in the provided JSON schema. Include the implementation
-approach, every validation command and actual result, failure or blocking reason
-when applicable, risks, and documentation status. Never claim a check passed
-unless you ran it.
+Return the final response in the provided JSON schema. `summary`, `changes`,
+and `approach` must describe the complete candidate diff from the original
+baseline, not merely the latest agent or validation-repair turn. Include every
+validation command and actual result, a failure or blocking reason when
+applicable, risks, and documentation status. Never claim a check passed unless
+you ran it.
