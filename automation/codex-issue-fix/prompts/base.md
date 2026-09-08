@@ -24,10 +24,13 @@ Shared rules:
   target repository before editing. For Terraform files, use the repository's
   `$terraform` skill for implementation and troubleshooting guidance.
 - Before finishing, explicitly use the target repository's
-  `$repository-validation` skill and run every required check it defines. If a
+  `$repository-validation` skill and follow its execution contract. If a
+  trusted `scripts/validate.sh` is defined, the controller runs it outside the
+  Codex sandbox and replaces your pending validation placeholder with the real
+  result; do not execute that script or its provider-facing command yourself.
+  If only normal validation commands are defined, run them as instructed. If a
   setup script is provided, the trusted controller has already run it before
-  this turn; do not run it again inside the network-restricted sandbox. Use the
-  prepared tools and the repository's documented lockfiles, caches, or mirrors.
+  this turn; never run it again inside the network-restricted sandbox.
   Never claim validation passed when dependency initialization failed. Run a
   dependent check only when its prerequisite succeeds; otherwise report the
   dependent check as `skipped` and name the failed prerequisite. Use `failed`
