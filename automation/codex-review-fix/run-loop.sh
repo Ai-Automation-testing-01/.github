@@ -76,16 +76,20 @@ FIX_RULES='- Modify only files required by the agreed findings. Do not infer a r
 - If you notice an unrelated issue, report it in the summary and do not change it.'
 
 if [ -x "$REPOSITORY_VALIDATION_RUNNER" ]; then
-  VALIDATION_RULES='The trusted controller runs repository validation outside
+  IFS= read -r -d '' VALIDATION_RULES <<'VALIDATION_RULES_EOF' || :
+The trusted controller runs repository validation outside
 the Codex sandbox after your fixes. Do not run setup.sh or repository validation
-commands yourself, and do not claim that validation passed.'
+commands yourself, and do not claim that validation passed.
+VALIDATION_RULES_EOF
 else
-  VALIDATION_RULES='Before finishing, read and use the target repository's
+  IFS= read -r -d '' VALIDATION_RULES <<'VALIDATION_RULES_EOF' || :
+Before finishing, read and use the target repository's
 `.agents/skills/repository-validation/SKILL.md`. Run every command it defines.
 The trusted workflow already ran any setup.sh; do not run setup again.
 If a command fails because of your implementation, make one smallest repair
 and rerun the required checks once. Do not claim success when a dependency or
-environment problem prevents validation; report the exact command and result.'
+environment problem prevents validation; report the exact command and result.
+VALIDATION_RULES_EOF
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
