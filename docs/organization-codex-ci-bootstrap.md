@@ -287,7 +287,7 @@ Using [community-animal-registry-infrastructure-sandbox](file:///Users/mindstix-
 
 Create `AGENTS.md` in the root of the repository. It should inherit the organization policy and specify local conventions:
 
-```markdown
+````markdown
 # Repository Guidelines
 
 ## Policy Hierarchy
@@ -318,30 +318,30 @@ description: Validate changes before Codex finishes implementation. Runs safe lo
 
 # Validate repository changes
 
-Codex reads this skill, executes every command listed below, and reports actual output.
-Repository CI remains the final merge gate.
+The trusted workflow runs `scripts/setup.sh` before Codex starts. Codex must not
+run provider-facing validation inside its restricted sandbox. After Codex
+returns, the controller runs the protected baseline copy of
+`scripts/validate.sh` on the trusted GitHub runner. Repository CI remains the
+final merge gate.
 
-Run every command from the repository root before finishing:
+The trusted validator runs exactly:
 
 ```bash
-terraform fmt -check -recursive -no-color -diff
-(
-  cd infra/environments/preprod
-  terraform init -backend=false -input=false -no-color
-  terraform validate -no-color
-)
-tflint --recursive --no-color
+terraform -chdir=infra/environments/preprod validate -no-color
 ```
 
-If a check fails, make one safe repair attempt and rerun. Report results honestly.
-Do not run any command requiring cloud credentials or remote state locks.
-```
+Codex returns a blocked/skipped pending placeholder. The controller replaces it
+with the actual result, sends implementation failures through one bounded repair
+turn, and validates once more. Do not run Terraform plan, apply, TFLint, or any
+command requiring cloud credentials or remote state locks.
+````
 
 *(For a Node.js or Python repository, replace the bash commands with `npm test`, `pytest`, `eslint`, `ruff check`, etc.).*
 
 ### Step 4.3: Add Optional Toolchain Setup Script (`setup.sh`)
 
-If the disposable runner needs pinned CLI tools (such as Terraform and TFLint), add a `setup.sh` script:
+If the disposable runner needs pinned CLI tools, modules, or providers, add a
+`setup.sh` script:
 
 ```bash
 mkdir -p .agents/skills/repository-validation/scripts
@@ -355,7 +355,6 @@ set -euo pipefail
 
 runner_temp="${RUNNER_TEMP:?}"
 terraform_version="1.15.8"
-tflint_version="0.64.0"
 bin_dir="${runner_temp}/codex-validation-bin"
 mkdir -p "$bin_dir"
 
@@ -365,16 +364,12 @@ curl --fail --silent --show-error --location \
   "https://releases.hashicorp.com/terraform/${terraform_version}/terraform_${terraform_version}_linux_amd64.zip"
 echo "d25ce7b6902013ad905db3d2eab0be4cd905887fe88b81a6171b8d5503c31f3d  ${runner_temp}/terraform.zip" | sha256sum --check --status
 unzip -oq "${runner_temp}/terraform.zip" -d "$bin_dir"
-
-# Download and verify TFLint
-curl --fail --silent --show-error --location \
-  --output "${runner_temp}/tflint.zip" \
-  "https://github.com/terraform-linters/tflint/releases/download/v${tflint_version}/tflint_linux_amd64.zip"
-echo "cca9d13e2e1d7a2c627af60ff899a3c9b74212899416aeb96ec764d2ef954537  ${runner_temp}/tflint.zip" | sha256sum --check --status
-unzip -oq "${runner_temp}/tflint.zip" -d "$bin_dir"
-
-chmod 700 "${bin_dir}/terraform" "${bin_dir}/tflint"
+chmod 700 "${bin_dir}/terraform"
 echo "$bin_dir" >> "${GITHUB_PATH:?}"
+
+# Repository-specific setup must also initialize modules/providers with
+# -backend=false, create a lockfile-backed provider mirror, and export its
+# writable TF_DATA_DIR/TF_PLUGIN_CACHE_DIR/TF_CLI_CONFIG_FILE via GITHUB_ENV.
 ```
 
 > [!IMPORTANT]
@@ -383,6 +378,22 @@ echo "$bin_dir" >> "${GITHUB_PATH:?}"
 > chmod +x .agents/skills/repository-validation/scripts/setup.sh
 > git add --chmod=+x .agents/skills/repository-validation/scripts/setup.sh
 > ```
+
+Add `.agents/skills/repository-validation/scripts/validate.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  command) echo 'terraform -chdir=infra/environments/preprod validate -no-color' ;;
+  run) terraform -chdir="$2/infra/environments/preprod" validate -no-color ;;
+  *) exit 2 ;;
+esac
+```
+
+Commit it with executable mode as well. The interface is `command` plus
+`run <repository-root>`; exit `0` means passed, `1` means failed, and `2` means
+the trusted environment is blocked.
 
 ### Step 4.4: Add the Issue Fix Caller Workflow
 
@@ -608,8 +619,7 @@ If Codex sessions expire or return `401 Unauthorized`:
 | **Codex output empty or 401 Unauthorized** | Expired or invalid `CODEX_AUTH_JSON` | Re-authenticate via `codex login` on workstation and update the secret. |
 | **Setup failed: `setup.sh: Permission denied`** | `setup.sh` missing executable bit in Git | Run `chmod +x path/to/setup.sh` and `git add --chmod=+x path/to/setup.sh` then commit. |
 | **Codex completed but no PR was created** | Protected path, secret scan, no-change, or publishing gate rejected the candidate | Check the Actions result comment. Failed or blocked validation alone should now create a draft PR. Codex remains forbidden from modifying `.github/workflows/*`, `.agents/*`, or `.env*`. |
-| **Terraform init/validate is blocked in Codex** | Providers were not prepared before the network sandbox, or Terraform runtime paths are outside the writable workspace | Prepare a lockfile-backed provider mirror during `setup.sh`; place `TF_DATA_DIR`, `TF_PLUGIN_CACHE_DIR`, and `TF_CLI_CONFIG_FILE` under an ignored workspace directory. |
-| **TFLint go-plugin handshake fails** | The binary or temporary socket directory is outside a writable/executable sandbox path | Install the pinned TFLint binary inside the isolated workspace, set workspace-local `TMPDIR`, and use `--no-parallel-runners` for recursive validation. |
+| **Terraform provider handshake fails in Codex** | Provider processes cannot initialize inside the restricted Codex runtime | Do not execute provider-facing validation in Codex. Prepare it with `setup.sh` and run it through trusted `validate.sh` on the GitHub runner. |
 | **Review-fix runs in an infinite loop** | Commit message guard bypassed or modified | Ensure commit message contains `[codex-autofix]`, which the caller step checks to prevent re-triggering. |
 | **`The uses attribute cannot contain expressions`** | Attempted to use dynamic `${{ github.repository_owner }}` in caller `jobs.<id>.uses` | GitHub Actions strictly requires `jobs.<id>.uses` to be a literal static string. Replace with actual organization name (e.g. `NEW_ORG/.github/...`). |
 

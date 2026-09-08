@@ -735,9 +735,11 @@ jobs:
           git -C "$REPOSITORY_ROOT" push origin --delete "$FIX_BRANCH" ||
             echo "::warning::Could not delete orphaned branch ${FIX_BRANCH}"
 
-      # Report all eligible outcomes, including safe no-change outcomes.
+      # Report completed eligible outcomes, including safe no-change outcomes.
+      # A superseded run must not overwrite the replacement run's comment or
+      # result labels with a generic failure while cancellation unwinds.
       - name: Report automation result
-        if: always() && steps.verify.outputs.eligible == 'true'
+        if: always() && !cancelled() && steps.verify.outputs.eligible == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           DID_FIX: ${{ steps.publish.outputs.did_fix }}

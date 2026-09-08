@@ -465,14 +465,16 @@ The reusable workflow accepts these inputs:
 | `CLIENT_ID` | Yes | GitHub App client ID. |
 | `PRIVATE_KEY` | Yes | GitHub App private key. |
 
-### Codex-owned validation
+### Repository-owned trusted validation
 
 The repository provides `.agents/skills/repository-validation/SKILL.md`.
-Codex reads that skill, runs its setup and every required command, fixes
-implementation-caused failures once, and reports every command and result.
-The shared workflow does not contain a repository validation script or assume
-any directory, language, provider, runtime, or package manager. Repository CI
-remains the authoritative merge gate.
+The shared workflow runs the reviewed base branch's optional setup script before
+Codex starts. Repositories whose tools cannot execute in the Codex sandbox may
+also provide executable `scripts/validate.sh`. The controller copies the
+protected baseline version and runs it on the trusted GitHub runner after Codex
+returns. The repository script defines the exact command; the shared controller
+only implements the generic `command` and `run <repository-root>` interface.
+Repository CI remains the authoritative merge gate.
 
 The issue controller enables MCP servers only when the caller opts in. AWS uses
 the managed AWS Knowledge endpoint. Terraform uses the official registry-only
@@ -533,9 +535,19 @@ fix, create a fresh PR event or push a legitimate new commit.
 
 ### 8.5 Repository-owned validation setup
 
-Codex reads the repository validation skill and runs its setup and validation
-commands. The reusable workflow does not install stack tooling or execute
-repository validation commands.
+Before starting Codex, the reusable workflow checks the PR base commit for
+`.agents/skills/repository-validation/scripts/setup.sh`. If present, it must be
+executable. The workflow extracts that reviewed base-branch version into the
+runner temporary directory and executes it against the PR checkout. This makes
+repository-owned tools and environment variables available to the subsequent
+review loop without executing a setup script controlled by the PR head.
+
+The workflow similarly extracts an executable base-branch `validate.sh`, when
+present, and exposes only that protected copy to the review controller. Codex
+does not run setup or trusted validation inside its sandbox. After fixes, the
+controller executes validation on the runner and adds the actual result to the
+evidence comment. Repositories without these scripts retain the legacy
+skill-defined behavior. Repository CI remains the authoritative merge gate.
 
 ### 8.6 Seed Codex authentication
 
@@ -638,8 +650,10 @@ maintainer.
 
 Editing a contributor issue removes its prior approval. Removing the approval
 label also reruns verification, and issue concurrency cancels older runs when a
-new edit or approval state arrives. PR and issue result messages include issue
-author, approval maintainer, trigger actor, and workflow run ID.
+new edit or approval state arrives. Cancelled superseded runs do not post a
+result comment or change result labels; the replacement run owns that output.
+PR and issue result messages include issue author, approval maintainer, trigger
+actor, and workflow run ID.
 
 Review automation subscribes to `opened`, `synchronize`, and `reopened`. Every
 human push naturally creates `synchronize`. An automatic fix push also creates
@@ -945,7 +959,7 @@ merge, Terraform apply, or remote database migration was run. The text
 `Overall status: blocked` is intentionally not used: environment limitations
 are displayed as `incomplete — environment or tooling limitation`.
 
-The final issue result comment is marked
+For an eligible run that was not cancelled, the final issue result comment is marked
 `<!-- codex-issue-fix-result -->`. It reports the target branch, stop reason,
 PR URL or `No pull request was created.`, and validation status when the
 secret-scanned result is available. It distinguishes “branch was pushed, but
@@ -970,10 +984,10 @@ Apply Codex auto-fix round <anything> [codex-autofix]
 When skipped, authentication, Codex, the loop, cleanup, and
 evidence comment are skipped. A human or other non-matching commit proceeds.
 
-The reusable workflow does not install stack-specific tooling or execute
-repository validation commands. Codex reads the repository validation skill
-and is responsible for setup, runtime, dependency, provider, plugin, cache,
-module, and validation work.
+The reusable workflow does not define stack-specific tooling or validation
+commands. It executes the reviewed base branch's optional setup and validator
+scripts. The repository owns runtime, dependency, provider, cache, module, and
+validation details; provider-facing validation runs outside the Codex sandbox.
 
 The workflow prepares and restores the same two Linux sysctl settings as the
 issue workflow. It rejects an empty `CODEX_AUTH_JSON`, writes the raw secret
@@ -1090,11 +1104,10 @@ Git diff.
 
 Terraform repository setup should prepare providers before the network-restricted
 agent turn, store the Terraform data directory and plugin cache in writable,
-ignored workspace paths, and use a local provider mirror. TFLint should likewise
-run from the writable workspace with a writable temporary directory so its
-bundled go-plugin worker can complete the protocol handshake. A remaining
-blocked result is evidence that human follow-up is required; it is not permission
-to merge or deploy.
+ignored workspace paths, and use a local provider mirror. Provider-facing
+validation should run through the trusted validator after the agent turn, not
+inside Codex. A remaining blocked result is evidence that human follow-up is
+required; it is not permission to merge or deploy.
 
 ## 16. Definition of done
 
