@@ -156,13 +156,13 @@ git rev-parse HEAD
 ---
 
 ## Phase 2: Create & Configure the Publishing GitHub App
-
+![alt text](image.png)
 **Where to make this change:** GitHub Organization Settings → Developer Settings.
 
 The GitHub App creates an ephemeral, authenticated identity used by GitHub Actions to push branches, commit fixes, and open PRs. Pushes made by an App token trigger normal repository CI checks (unlike standard `GITHUB_TOKEN` pushes).
 
 ### Step 2.1: Register the App
-
+![alt text](image-1.png)
 1. Go to: `https://github.com/organizations/NEW_ORG/settings/apps`.
 2. Click **New GitHub App**.
 3. Fill in the required fields:
@@ -176,7 +176,7 @@ The GitHub App creates an ephemeral, authenticated identity used by GitHub Actio
 | **Where can this app be installed?** | **Only on this account** | Keeps the App private to your org |
 
 ### Step 2.2: Set Minimum Permissions
-
+![alt text](image-2.png)
 Under **Repository permissions**, configure exactly:
 
 | Permission | Access | Why It Is Needed |
@@ -209,7 +209,7 @@ Click **Create GitHub App**.
 ---
 
 ## Phase 3: Set Up Authentication & Organization Secrets
-
+![alt text](image-3.png)
 **Where to make this change:** Workstation terminal + GitHub Organization Secrets settings.
 
 The automation requires three organization secrets:
